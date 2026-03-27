@@ -229,10 +229,12 @@ inline void cublas_streams_wait_current(cudaStream_t stream)
     }
 }
 
+template <typename CType>
 void CublasGemm(cublasHandle_t cublas_handle,
     c10::BFloat16 *a, int64_t a_rows, int64_t a_cols, bool trans_a,
 		c10::BFloat16 *b, int64_t b_rows, int64_t b_cols, bool trans_b,
-		c10::BFloat16 *c, int64_t c_rows, int64_t c_cols) {
+		CType *c, int64_t c_rows, int64_t c_cols,
+    float alpha = 1.0f, float beta = 0.0f) {
   int m = trans_b ? b_rows : b_cols;
   int k = trans_b ? b_cols : b_rows;
   int n = trans_a ? a_cols : a_rows;
@@ -243,8 +245,8 @@ void CublasGemm(cublasHandle_t cublas_handle,
   cublasOperation_t transpose_b = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
 
 
-  float alpha = 1.0, beta = 0.0;
-  CUBLAS_CALL(cublasGemmEx(cublas_handle,
+  if constexpr (std::is_same_v<CType, c10::BFloat16>) {
+    CUBLAS_CALL(cublasGemmEx(cublas_handle,
 			   transpose_b, transpose_a,
 			   m, n, k, &alpha,
 			   b, CUDA_R_16BF, ldb,
@@ -252,6 +254,16 @@ void CublasGemm(cublasHandle_t cublas_handle,
 			   &beta,
 			   c, CUDA_R_16BF, c_cols, CUDA_R_32F,
 			   CUBLAS_GEMM_DEFAULT));
+  } else if constexpr (std::is_same_v<CType, float>) {
+    CUBLAS_CALL(cublasGemmEx(cublas_handle,
+			   transpose_b, transpose_a,
+			   m, n, k, &alpha,
+			   b, CUDA_R_16BF, ldb,
+			   a, CUDA_R_16BF, lda,
+			   &beta,
+			   c, CUDA_R_32F, c_cols, CUDA_R_32F,
+			   CUBLAS_GEMM_DEFAULT));
+  }
 }
 
 void CublasGroupedGemm(torch::Tensor a,
@@ -285,25 +297,28 @@ void CublasGroupedGemm(torch::Tensor a,
   cublas_current_wait_streams(c10::cuda::getCurrentCUDAStream());
 }
 
+template <typename CType>
 void CublasGroupedGemmVariableK(torch::Tensor a,
 				torch::Tensor b,
 				torch::Tensor c,
-				torch::Tensor batch_sizes) {
+				torch::Tensor batch_sizes,
+        float alpha = 1.0f, 
+        float beta = 0.0f) {
   if (!cublas_init)
     cublas_handle_init();
 
   int64_t bs = batch_sizes.size(0), m = a.size(1), n = b.size(1);
   c10::BFloat16* a_ptr = a.data_ptr<c10::BFloat16>();
   c10::BFloat16* b_ptr = b.data_ptr<c10::BFloat16>();
-  c10::BFloat16* c_ptr = c.data_ptr<c10::BFloat16>();
+  CType* c_ptr = c.data_ptr<CType>();
 
   cublas_streams_wait_current(c10::cuda::getCurrentCUDAStream());
 
   for (int i = 0; i < bs; ++i) {
     int64_t k = batch_sizes.data_ptr<int64_t>()[i];
-    CublasGemm(cublas_handle[i % NUM_STREAM], a_ptr, k, m, /*trans_a=*/true,
+    CublasGemm<CType>(cublas_handle[i % NUM_STREAM], a_ptr, k, m, /*trans_a=*/true,
 	       b_ptr, k, n, /*trans_b=*/false,
-	       c_ptr, m, n);
+	       c_ptr, m, n, alpha, beta);
     a_ptr += k * m;
     b_ptr += k * n;
     c_ptr += m * n;
@@ -315,7 +330,8 @@ void CublasGroupedGemmVariableK(torch::Tensor a,
 void GroupedGemmVariableK(torch::Tensor a,
 			  torch::Tensor b,
 			  torch::Tensor c,
-			  torch::Tensor batch_sizes) {
+			  torch::Tensor batch_sizes,
+        float alpha, float beta) {
   // We expected a CUDA tensor with two dimensions and shape
   // (tokens, hidden_out) for 'b'.
   TORCH_CHECK(b.is_cuda());
@@ -332,13 +348,22 @@ void GroupedGemmVariableK(torch::Tensor a,
   // Validate the output shape.
   TORCH_CHECK(c.is_cuda());
   TORCH_CHECK(c.ndimension() == 3);
-  TORCH_CHECK(c.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(c.scalar_type() == torch::kBFloat16 || c.scalar_type() == torch::kFloat32);
   TORCH_CHECK(c.size(0) == num_experts);
   TORCH_CHECK(c.size(1) == m);
   TORCH_CHECK(c.size(2) == n);
 
   // Run the computation.
-  CublasGroupedGemmVariableK(a, b, c, batch_sizes);
+  if (c.scalar_type() == torch::kBFloat16) {
+    CublasGroupedGemmVariableK<c10::BFloat16>(a, b, c, batch_sizes, alpha, beta);
+    return;
+  } else if (c.scalar_type() == torch::kFloat32) {
+    CublasGroupedGemmVariableK<float>(a, b, c, batch_sizes, alpha, beta);
+    return;
+  } else {
+    TORCH_CHECK(false, "Unsupported data type for output tensor 'c'");
+  }
+  // CublasGroupedGemmVariableK(a, b, c, batch_sizes);
 }
 
 // NOTE: We only support dynamic group sizes for the 'a' tensor. Tensor 'b' is
@@ -349,7 +374,8 @@ void GroupedGemm(torch::Tensor a,
 		 torch::Tensor b,
 		 torch::Tensor c,
 		 torch::Tensor batch_sizes,
-		 bool trans_a, bool trans_b) {
+		 bool trans_a, bool trans_b,
+     float alpha, float beta) {
   // NOTE: We only support 'trans_a' or 'trans_b', not both.
   TORCH_CHECK(!(trans_a && trans_b));
 
@@ -366,7 +392,7 @@ void GroupedGemm(torch::Tensor a,
 
   // Defer to the variable 'k' helper for the rest of the op.
   if (trans_a) {
-    GroupedGemmVariableK(a, b, c, batch_sizes);
+    GroupedGemmVariableK(a, b, c, batch_sizes, alpha, beta);
     return;
   }
 

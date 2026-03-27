@@ -3,6 +3,7 @@ import itertools
 
 from absl.testing import parameterized
 from grouped_gemm import ops
+import grouped_gemm
 import numpy as np
 import torch
 
@@ -35,9 +36,9 @@ _TEST_PROBLEMS = add_transpose_flags((
 ))
 
 
-def randn(bs, x, y):
+def randn(bs, x, y, dtype=torch.bfloat16):
     out = (torch.rand(bs, x, y) - 0.5 * 2) / (y * x)
-    return out.cuda().to(torch.bfloat16)
+    return out.cuda().to(dtype)
 
 
 def gmm(a, b, batch_sizes, trans_b=False):
@@ -48,6 +49,17 @@ def gmm(a, b, batch_sizes, trans_b=False):
     for i, size in enumerate(batch_sizes):
         rhs = b[i, :, :].t() if trans_b else b[i, :, :]
         out.append(a[start:start + size, :] @ rhs)
+        start += size
+    return torch.cat(out)
+
+def gmmv(a, b, c, batch_sizes, trans_b=False):
+    batch_sizes = batch_sizes.numpy()
+
+    out = []
+    start = 0
+    for i, size in enumerate(batch_sizes):
+        rhs = b[start:start + size, :].t() if trans_b else b[start:start + size, :]
+        out.append((a[start:start + size, :].t() @ rhs) + c[i, :, :])
         start += size
     return torch.cat(out)
 
@@ -103,6 +115,36 @@ class OpsTest(parameterized.TestCase):
         self.assertTrue(allclose(a.grad, a_ref.grad))
         self.assertTrue(allclose(b.grad, b_ref.grad))
 
+    def testGroupedGemm_VariableSizesFP32(self, z, m, k, n, trans_b):
+        torch.manual_seed(0)
+        a = randn(z, m, k).view(-1, k)
+        b = randn(z, m, n).view(-1, n)
+        c = randn(z, k, n, dtype=torch.float32)
+
+        dist = torch.rand(z, )
+        dist /= dist.sum()
+        batch_sizes = (dist * m).to(torch.long)
+        error = m * z - batch_sizes.sum()
+        batch_sizes[-1] += error
+        assert batch_sizes.sum() == (m * z)
+
+        a_ref = a.detach().clone()
+        b_ref = b.detach().clone()
+        c_ref = c.detach().clone()
+
+        out = grouped_gemm.grouped_gemm.backend.gmm(
+            a, 
+            b,
+            batch_sizes,
+            trans_a=True,
+            trans_b=False,
+            c = c,
+            alpha=1.0,
+            beta=1.0
+        )
+        
+        expected_out = gmmv(a_ref, b_ref, c_ref, batch_sizes, False)
+        self.assertTrue(allclose(out, expected_out.view(out.shape)))
 
 
 if __name__ == '__main__':

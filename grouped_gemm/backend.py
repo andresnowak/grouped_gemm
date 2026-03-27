@@ -21,10 +21,10 @@ def _allocate_output(a, b, batch_sizes, trans_a, trans_b):
     )
     return torch.empty(*shape, device=a.device, dtype=a.dtype)
 
-def gmm(a, b, batch_sizes, trans_a=False, trans_b=False, c=None):
+def gmm(a, b, batch_sizes, trans_a=False, trans_b=False, c=None, alpha=1.0, beta=0.0):
     if c is None:
         c = _allocate_output(a, b, batch_sizes, trans_a, trans_b)
-    backend.gmm(a, b, c, batch_sizes, trans_a, trans_b)
+    backend.gmm(a, b, c, batch_sizes, trans_a, trans_b, alpha, beta)
     return c
 
 def sinkhorn(cost, tol=0.0001):
