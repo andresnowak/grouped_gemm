@@ -37,7 +37,10 @@ _TEST_PROBLEMS = add_transpose_flags((
 
 
 def randn(bs, x, y, dtype=torch.bfloat16):
-    out = (torch.rand(bs, x, y) - 0.5 * 2) / (y * x)
+    if bs >= 1:
+        out = (torch.rand(bs, x, y) - 0.5 * 2) / (y * x)
+    else:
+        out = (torch.rand(x, y) - 0.5 * 2) / (y * x)
     return out.cuda().to(dtype)
 
 
@@ -47,7 +50,10 @@ def gmm(a, b, batch_sizes, trans_b=False):
     out = []
     start = 0
     for i, size in enumerate(batch_sizes):
-        rhs = b[i, :, :].t() if trans_b else b[i, :, :]
+        if isinstance(b, list):
+            rhs = b[i][:, :].t() if trans_b else b[i][:, :]
+        else:
+            rhs = b[i, :, :].t() if trans_b else b[i, :, :]
         out.append(a[start:start + size, :] @ rhs)
         start += size
     return torch.cat(out)
@@ -59,7 +65,11 @@ def gmmv(a, b, c, batch_sizes, trans_b=False):
     start = 0
     for i, size in enumerate(batch_sizes):
         rhs = b[start:start + size, :].t() if trans_b else b[start:start + size, :]
-        out.append((a[start:start + size, :].t() @ rhs) + c[i, :, :])
+        if isinstance(c, list):
+            out.append((a[start:start + size, :].t() @ rhs) + c[i][:, :])
+            return out
+        else:
+            out.append((a[start:start + size, :].t() @ rhs) + c[i, :, :])
         start += size
     return torch.cat(out)
 
@@ -87,6 +97,26 @@ class OpsTest(parameterized.TestCase):
         expected_out.sum().backward()
         self.assertTrue(allclose(a.grad, a_ref.grad))
         self.assertTrue(allclose(b.grad, b_ref.grad))
+
+    def testGroupedGemm_FixedSizesList(self, z, m, k, n, trans_b):
+        torch.manual_seed(0)
+        a = randn(z, m, k).view(-1, k)
+        b = [randn(0, n, k) if trans_b else randn(0, k, n) for _ in range(z)]
+        batch_sizes = torch.tensor([m] * z)
+
+        a.requires_grad_(True)
+        for i in range(z):
+            b[i].requires_grad_(True)
+        a_ref = a.detach().clone().requires_grad_(True)
+        b_ref = [i.detach().clone().requires_grad_(True) for i in b]
+
+        out = grouped_gemm.grouped_gemm.backend.gmmfwd(
+            a, b, batch_sizes, 
+            trans_a=False,
+            trans_b=trans_b
+        )
+        expected_out = gmm(a_ref, b_ref, batch_sizes, trans_b)
+        self.assertTrue(allclose(out, expected_out))
 
     def testGroupedGemm_VariableSizes(self, z, m, k, n, trans_b):
         torch.manual_seed(0)
@@ -145,6 +175,38 @@ class OpsTest(parameterized.TestCase):
         
         expected_out = gmmv(a_ref, b_ref, c_ref, batch_sizes, False)
         self.assertTrue(allclose(out, expected_out.view(out.shape)))
+
+    def testGroupedGemm_VariableSizesFP32List(self, z, m, k, n, trans_b):
+        torch.manual_seed(0)
+        a = randn(z, m, k).view(-1, k)
+        b = randn(z, m, n).view(-1, n)
+        c = [randn(0, k, n, dtype=torch.float32) for _ in range(z)]
+
+        dist = torch.rand(z, )
+        dist /= dist.sum()
+        batch_sizes = (dist * m).to(torch.long)
+        error = m * z - batch_sizes.sum()
+        batch_sizes[-1] += error
+        assert batch_sizes.sum() == (m * z)
+
+        a_ref = a.detach().clone()
+        b_ref = b.detach().clone()
+        c_ref = [i.detach().clone() for i in c]
+
+        out = grouped_gemm.grouped_gemm.backend.gmmbwd(
+            a, 
+            b,
+            batch_sizes,
+            trans_a=True,
+            trans_b=False,
+            c = c,
+            alpha=1.0,
+            beta=1.0
+        )
+        
+        expected_out = gmmv(a_ref, b_ref, c_ref, batch_sizes, False)
+        for o, e in zip(out, expected_out):
+            self.assertTrue(allclose(o, e.view(o.shape)))
 
 
 if __name__ == '__main__':

@@ -437,4 +437,123 @@ void GroupedGemm(torch::Tensor a,
 #endif
 }
 
+void GroupedGemmFwd(
+	torch::Tensor a,
+	std::vector<torch::Tensor> b,
+	torch::Tensor c,
+	torch::Tensor batch_sizes,
+	bool trans_a, bool trans_b,
+	float alpha, float beta)
+{
+  // NOTE: We only support 'trans_a' or 'trans_b', not both.
+  // TORCH_CHECK(!trans_b);
+
+  // We expect the batch_sizes on CPU.
+  TORCH_CHECK(batch_sizes.is_cpu());
+  TORCH_CHECK(batch_sizes.ndimension() == 1);
+  TORCH_CHECK(batch_sizes.scalar_type() == torch::kInt64);
+
+  // We expected a CUDA tensor with two dimensions and shape
+  // (tokens, hidden_in) for 'a'.
+  TORCH_CHECK(a.is_cuda());
+  TORCH_CHECK(a.ndimension() == 2);
+  TORCH_CHECK(a.scalar_type() == torch::kBFloat16);
+
+  if (!cublas_init)
+    cublas_handle_init();
+
+  int64_t bs = batch_sizes.size(0), k = a.size(1);
+  int64_t n = trans_b ? b[0].size(0) : b[0].size(1);
+  int64_t b_rows = b[0].size(0), b_cols = b[0].size(1);
+  c10::BFloat16* a_ptr = a.data_ptr<c10::BFloat16>();
+  c10::BFloat16* c_ptr = c.data_ptr<c10::BFloat16>();
+
+  cublas_streams_wait_current(c10::cuda::getCurrentCUDAStream());
+
+  for (int i = 0; i < bs; ++i) {
+    c10::BFloat16* b_ptr = b[i].data_ptr<c10::BFloat16>();
+    int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+    CublasGemm(cublas_handle[i % NUM_STREAM], a_ptr, m, k, /*trans_a=*/false,
+	       b_ptr, b_rows, b_cols, trans_b,
+	       c_ptr, m, n);
+    a_ptr += m * k;
+    c_ptr += m * n;
+  }
+
+  cublas_current_wait_streams(c10::cuda::getCurrentCUDAStream());
+}
+
+void GroupedGemmBwd(
+	torch::Tensor a,
+	torch::Tensor b,
+	std::vector<torch::Tensor> c,
+	torch::Tensor batch_sizes,
+	bool trans_a, bool trans_b,
+	float alpha, float beta)
+{
+  // NOTE: We only support 'trans_a' or 'trans_b', not both.
+  TORCH_CHECK(trans_a);
+  TORCH_CHECK(!trans_b);
+
+  // We expected a CUDA tensor with two dimensions and shape
+  // (tokens, hidden_out) for 'b'.
+  TORCH_CHECK(b.is_cuda());
+  TORCH_CHECK(b.ndimension() == 2);
+  TORCH_CHECK(b.scalar_type() == torch::kBFloat16);
+
+  // Validate the dimensions.
+  int64_t tokens = a.size(0), num_experts = batch_sizes.size(0);
+  int64_t m = a.size(1), n = b.size(1);
+
+  // Validate that we have the same contraction dimension.
+  TORCH_CHECK(tokens == b.size(0));
+
+  // Validate the output shape.
+  TORCH_CHECK(c[0].is_cuda());
+  TORCH_CHECK(c[0].scalar_type() == torch::kBFloat16 || c[0].scalar_type() == torch::kFloat32);
+  TORCH_CHECK(c.size() == num_experts);
+  TORCH_CHECK(c[0].size(0) == m);
+  TORCH_CHECK(c[0].size(1) == n);
+
+  if (!cublas_init)
+    cublas_handle_init();
+
+  int64_t bs = batch_sizes.size(0);
+  c10::BFloat16* a_ptr = a.data_ptr<c10::BFloat16>();
+  c10::BFloat16* b_ptr = b.data_ptr<c10::BFloat16>();
+
+  cublas_streams_wait_current(c10::cuda::getCurrentCUDAStream());
+
+  // Run the computation.
+  if (c[0].scalar_type() == torch::kBFloat16) {
+    for (int i = 0; i < bs; ++i) {
+      int64_t k = batch_sizes.data_ptr<int64_t>()[i];
+      c10::BFloat16* c_ptr = c[i].data_ptr<c10::BFloat16>();
+      CublasGemm<c10::BFloat16>(
+          cublas_handle[i % NUM_STREAM], a_ptr, k, m, /*trans_a=*/trans_a,
+          b_ptr, k, n, /*trans_b=*/trans_b,
+          c_ptr, m, n, alpha, beta);
+      a_ptr += k * m;
+      b_ptr += k * n;
+    }
+    return;
+  } else if (c[0].scalar_type() == torch::kFloat32) {
+    for (int i = 0; i < bs; ++i) {
+      int64_t k = batch_sizes.data_ptr<int64_t>()[i];
+      float* c_ptr = c[i].data_ptr<float>();
+      CublasGemm<float>(
+          cublas_handle[i % NUM_STREAM], a_ptr, k, m, /*trans_a=*/trans_a,
+          b_ptr, k, n, /*trans_b=*/trans_b,
+          c_ptr, m, n, alpha, beta);
+      a_ptr += k * m;
+      b_ptr += k * n;
+    }
+    return;
+  } else {
+    TORCH_CHECK(false, "Unsupported data type for output tensor 'c'");
+  }
+
+  
+}
+
 }  // namespace grouped_gemm

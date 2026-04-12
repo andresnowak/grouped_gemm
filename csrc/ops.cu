@@ -8,6 +8,8 @@ namespace grouped_gemm {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gmm", &GroupedGemm, "Grouped GEMM.");
+  m.def("gmmfwd", &GroupedGemmFwd, "Grouped GEMM Forward.");
+  m.def("gmmbwd", &GroupedGemmBwd, "Grouped GEMM Backward.");
   m.def("sinkhorn", &sinkhorn, "Sinkhorn kernel");
   m.def("permute", &moe_permute_topK_op, "Token permutation kernel");
   m.def("unpermute", &moe_recover_topK_op, "Token un-permutation kernel");
