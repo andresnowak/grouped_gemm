@@ -27,7 +27,7 @@ def gmm(a, b, batch_sizes, trans_a=False, trans_b=False, c=None, alpha=1.0, beta
     backend.gmm(a, b, c, batch_sizes, trans_a, trans_b, alpha, beta)
     return c
 
-def gmmfwd(a, b, batch_sizes, trans_a=False, trans_b=False, c=None, alpha=1.0, beta=0.0):
+def gmmfwd(a, b, batch_sizes, compute_streams, trans_a=False, trans_b=False, c=None, alpha=1.0, beta=0.0):
     if c is None:
         shape = (
             (batch_sizes.shape[0], a.shape[1], b[0].shape[1])
@@ -35,10 +35,10 @@ def gmmfwd(a, b, batch_sizes, trans_a=False, trans_b=False, c=None, alpha=1.0, b
             (a.shape[0], (b[0].shape[0] if trans_b else b[0].shape[1]))
         )
         c = torch.empty(*shape, device=a.device, dtype=a.dtype)
-    backend.gmmfwd(a, b, c, batch_sizes, trans_a, trans_b, alpha, beta)
+    backend.gmmfwd(a, b, c, batch_sizes, compute_streams, trans_a, trans_b, alpha, beta)
     return c
 
-def gmmbwd(a, b, batch_sizes, trans_a=False, trans_b=False, c=None, alpha=1.0, beta=0.0):
+def gmmbwd(a, b, batch_sizes, compute_streams, trans_a=False, trans_b=False, c=None, alpha=1.0, beta=0.0):
     if c is None:
         shape = (
             (a.shape[1], b.shape[1])
@@ -46,7 +46,7 @@ def gmmbwd(a, b, batch_sizes, trans_a=False, trans_b=False, c=None, alpha=1.0, b
             (a.shape[0], (b.shape[0] if trans_b else b.shape[1]))
         )
         c = [torch.empty(*shape, device=a.device, dtype=a.dtype) for _ in range(batch_sizes.shape[0])]
-    backend.gmmbwd(a, b, c, batch_sizes, trans_a, trans_b, alpha, beta)
+    backend.gmmbwd(a, b, c, batch_sizes, compute_streams, trans_a, trans_b, alpha, beta)
     return c
 
 def sinkhorn(cost, tol=0.0001):

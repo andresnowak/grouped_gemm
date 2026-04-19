@@ -192,6 +192,7 @@ cublasHandle_t cublas_handle[NUM_STREAM];
 cudaStream_t cublas_stream[NUM_STREAM];
 cudaEvent_t cublas_event[NUM_STREAM];
 bool cublas_init = false;
+bool cublas_init_external = false;
 
 void cublas_handle_init()
 {
@@ -204,6 +205,19 @@ void cublas_handle_init()
         cublasSetStream(cublas_handle[i], cublas_stream[i]);
         cudaEventCreate(&cublas_event[i]);
     }
+}
+
+void cublas_handle_init_external(
+  std::vector<cudaStream_t> streams
+) {
+  cublas_init = true;
+  cublas_init_external = true;
+  for (int i = 0; i < NUM_STREAM; i++)
+  {
+      cublas_stream[i] = streams[i];
+      cublasCreate(&cublas_handle[i]);
+      cublasSetStream(cublas_handle[i], cublas_stream[i]);
+  }
 }
 
 inline void cublas_current_wait_streams(cudaStream_t stream)
@@ -442,6 +456,7 @@ void GroupedGemmFwd(
 	std::vector<torch::Tensor> b,
 	torch::Tensor c,
 	torch::Tensor batch_sizes,
+  std::vector<int64_t> compute_streams,
 	bool trans_a, bool trans_b,
 	float alpha, float beta)
 {
@@ -459,8 +474,17 @@ void GroupedGemmFwd(
   TORCH_CHECK(a.ndimension() == 2);
   TORCH_CHECK(a.scalar_type() == torch::kBFloat16);
 
-  if (!cublas_init)
-    cublas_handle_init();
+  if (!cublas_init) {
+    if (compute_streams.empty()) {
+      cublas_handle_init();
+    } else {
+      std::vector<cudaStream_t> streams;
+      for (int64_t stream_id : compute_streams) {
+        streams.push_back(reinterpret_cast<cudaStream_t>(stream_id));
+      }
+      cublas_handle_init_external(streams);
+    }
+  }
 
   int64_t bs = batch_sizes.size(0), k = a.size(1);
   int64_t n = trans_b ? b[0].size(0) : b[0].size(1);
@@ -468,7 +492,8 @@ void GroupedGemmFwd(
   c10::BFloat16* a_ptr = a.data_ptr<c10::BFloat16>();
   c10::BFloat16* c_ptr = c.data_ptr<c10::BFloat16>();
 
-  cublas_streams_wait_current(c10::cuda::getCurrentCUDAStream());
+  if (!cublas_init_external) 
+    cublas_streams_wait_current(c10::cuda::getCurrentCUDAStream());
 
   for (int i = 0; i < bs; ++i) {
     c10::BFloat16* b_ptr = b[i].data_ptr<c10::BFloat16>();
@@ -480,7 +505,8 @@ void GroupedGemmFwd(
     c_ptr += m * n;
   }
 
-  cublas_current_wait_streams(c10::cuda::getCurrentCUDAStream());
+  if (!cublas_init_external)
+    cublas_current_wait_streams(c10::cuda::getCurrentCUDAStream());
 }
 
 void GroupedGemmBwd(
@@ -488,6 +514,7 @@ void GroupedGemmBwd(
 	torch::Tensor b,
 	std::vector<torch::Tensor> c,
 	torch::Tensor batch_sizes,
+  std::vector<int64_t> compute_streams,
 	bool trans_a, bool trans_b,
 	float alpha, float beta)
 {
@@ -515,14 +542,24 @@ void GroupedGemmBwd(
   TORCH_CHECK(c[0].size(0) == m);
   TORCH_CHECK(c[0].size(1) == n);
 
-  if (!cublas_init)
-    cublas_handle_init();
+  if (!cublas_init) {
+      if (compute_streams.empty()) {
+        cublas_handle_init();
+      } else {
+        std::vector<cudaStream_t> streams;
+        for (int64_t stream_id : compute_streams) {
+          streams.push_back(reinterpret_cast<cudaStream_t>(stream_id));
+        }
+        cublas_handle_init_external(streams);
+      }
+  }
 
   int64_t bs = batch_sizes.size(0);
   c10::BFloat16* a_ptr = a.data_ptr<c10::BFloat16>();
   c10::BFloat16* b_ptr = b.data_ptr<c10::BFloat16>();
 
-  cublas_streams_wait_current(c10::cuda::getCurrentCUDAStream());
+  if (!cublas_init_external)
+    cublas_streams_wait_current(c10::cuda::getCurrentCUDAStream());
 
   // Run the computation.
   if (c[0].scalar_type() == torch::kBFloat16) {
@@ -536,6 +573,8 @@ void GroupedGemmBwd(
       a_ptr += k * m;
       b_ptr += k * n;
     }
+    if (!cublas_init_external)
+      cublas_current_wait_streams(c10::cuda::getCurrentCUDAStream());
     return;
   } else if (c[0].scalar_type() == torch::kFloat32) {
     for (int i = 0; i < bs; ++i) {
@@ -548,6 +587,8 @@ void GroupedGemmBwd(
       a_ptr += k * m;
       b_ptr += k * n;
     }
+    if (!cublas_init_external)
+      cublas_current_wait_streams(c10::cuda::getCurrentCUDAStream());
     return;
   } else {
     TORCH_CHECK(false, "Unsupported data type for output tensor 'c'");
