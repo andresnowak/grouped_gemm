@@ -209,5 +209,24 @@ class OpsTest(parameterized.TestCase):
             self.assertTrue(allclose(o, e.view(o.shape)))
 
 
+def testBatchedH2D():
+    torch.manual_seed(0)
+    num_tensors = 32
+    srcs = [torch.nn.Parameter(torch.randn((2048, 1024), dtype=torch.bfloat16, pin_memory=True, device="cpu", requires_grad=True)) for _ in range(num_tensors)]
+    dsts = [torch.empty((2048, 1024), device="cuda:0", dtype=torch.bfloat16, requires_grad=False) for src in srcs]
+
+    stream = torch.cuda.Stream()
+    stream2 = torch.cuda.Stream()
+    grouped_gemm.grouped_gemm.backend.batched_h2d_async(srcs[0:5], dsts[0:5], stream.cuda_stream)
+    grouped_gemm.grouped_gemm.backend.batched_h2d_async(srcs[5:10], dsts[5:10], stream2.cuda_stream)
+
+    stream.synchronize()
+    stream2.synchronize()
+
+    for src, dst in zip(srcs[0:10], dsts[0:10]):
+        assert (allclose(src.cpu(), dst.cpu()))
+
+
 if __name__ == '__main__':
     unittest.main()
+    testBatchedH2D()
