@@ -17,6 +17,7 @@ void BatchedH2DAsync(
     std::vector<size_t> sizes(N);
 
     cudaStream_t h2d_sxtream_cast = reinterpret_cast<cudaStream_t>(h2d_stream);
+    int dev = gpu_tensors[0].get_device();
 
     for (int i = 0; i < N; i++) {
         // CPU tensors MUST be pinned for async copy
@@ -24,6 +25,8 @@ void BatchedH2DAsync(
                     "CPU tensor ", i, " must be pinned memory");
         TORCH_CHECK(cpu_tensors[i].is_contiguous(),
                     "CPU tensor ", i, " must be contiguous");
+        TORCH_CHECK(gpu_tensors[i].get_device() == dev, 
+                    "all gpu tensors must be on same device");
 
         srcs[i]  = cpu_tensors[i].data_ptr();
         dsts[i]  = gpu_tensors[i].data_ptr();
@@ -32,10 +35,10 @@ void BatchedH2DAsync(
 
     // Single attribute profile: all H2D
     cudaMemcpyAttributes attr = {};
-    attr.srcAccessOrder  = cudaMemcpySrcAccessOrderAny;
+    attr.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
     attr.srcLocHint.type = cudaMemLocationTypeHost;
     attr.dstLocHint.type = cudaMemLocationTypeDevice;
-    // arrt.dstLocHint.id = dsts[0].get_device();
+    attr.dstLocHint.id   = dev;
 
     std::vector<size_t> attrsIdxs = {0};
 
