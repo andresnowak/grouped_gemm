@@ -316,7 +316,7 @@ void CublasGroupedGemmVariableK(torch::Tensor a,
 				torch::Tensor b,
 				torch::Tensor c,
 				torch::Tensor batch_sizes,
-        float alpha = 1.0f, 
+        float alpha = 1.0f,
         float beta = 0.0f) {
   if (!cublas_init)
     cublas_handle_init();
@@ -492,7 +492,7 @@ void GroupedGemmFwd(
   c10::BFloat16* a_ptr = a.data_ptr<c10::BFloat16>();
   c10::BFloat16* c_ptr = c.data_ptr<c10::BFloat16>();
 
-  if (!cublas_init_external) 
+  if (!cublas_init_external)
     cublas_streams_wait_current(c10::cuda::getCurrentCUDAStream());
 
   for (int i = 0; i < bs; ++i) {
@@ -594,7 +594,7 @@ void GroupedGemmBwd(
     TORCH_CHECK(false, "Unsupported data type for output tensor 'c'");
   }
 
-  
+
 }
 
 }  // namespace grouped_gemm

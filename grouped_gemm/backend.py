@@ -52,6 +52,9 @@ def gmmbwd(a, b, batch_sizes, compute_streams, trans_a=False, trans_b=False, c=N
 def batched_h2d_async(srcs: list, dsts: list, h2d_stream):
     backend.batched_h2d_async(srcs, dsts, h2d_stream)
 
+def batched_d2h_async(srcs: list, dsts: list, d2h_stream):
+    backend.batched_d2h_async(srcs, dsts, d2h_stream)
+
 def sinkhorn(cost, tol=0.0001):
     return backend.sinkhorn(cost, tol)
 

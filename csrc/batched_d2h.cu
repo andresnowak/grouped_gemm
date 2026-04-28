@@ -6,48 +6,45 @@
 namespace grouped_gemm {
 
 
-void BatchedH2DAsync(
-    std::vector<torch::Tensor> cpu_tensors,
+void BatchedD2HAsync(
     std::vector<torch::Tensor> gpu_tensors,
-    int64_t h2d_stream
+    std::vector<torch::Tensor> cpu_tensors,
+    int64_t d2h_stream
 ) {
-    int N = cpu_tensors.size();
+    int N = gpu_tensors.size();
 
     std::vector<void*> srcs(N), dsts(N);
     std::vector<size_t> sizes(N);
 
-    cudaStream_t h2d_sxtream_cast = reinterpret_cast<cudaStream_t>(h2d_stream);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(d2h_stream);
     int dev = gpu_tensors[0].get_device();
 
     for (int i = 0; i < N; i++) {
-        // CPU tensors MUST be pinned for async copy (but not in machiens like grace hopper)
         TORCH_CHECK(cpu_tensors[i].is_pinned(),
                     "CPU tensor ", i, " must be pinned memory");
         TORCH_CHECK(cpu_tensors[i].is_contiguous(),
                     "CPU tensor ", i, " must be contiguous");
-        TORCH_CHECK(gpu_tensors[i].get_device() == dev, 
+        TORCH_CHECK(gpu_tensors[i].get_device() == dev,
                     "all gpu tensors must be on same device");
 
-        srcs[i]  = cpu_tensors[i].data_ptr();
-        dsts[i]  = gpu_tensors[i].data_ptr();
-        sizes[i] = cpu_tensors[i].nbytes();
+        srcs[i]  = gpu_tensors[i].data_ptr();
+        dsts[i]  = cpu_tensors[i].data_ptr();
+        sizes[i] = gpu_tensors[i].nbytes();
     }
 
-    // Single attribute profile: all H2D
+    // Single attribute profile: all D2H
     cudaMemcpyAttributes attr = {};
-    attr.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
-    attr.srcLocHint.type = cudaMemLocationTypeHost;
-    attr.dstLocHint.type = cudaMemLocationTypeDevice;
+    attr.srcAccessOrder  = cudaMemcpySrcAccessOrderStream; // we guarantee that we read on the order of the loads in the stream
+    attr.srcLocHint.type = cudaMemLocationTypeDevice;
     attr.dstLocHint.id   = dev;
-
     std::vector<size_t> attrsIdxs = {0};
 
     cudaError_t err = cudaMemcpyBatchAsync(
         dsts.data(), srcs.data(), sizes.data(), (size_t) N,
         &attr, attrsIdxs.data(), 1,
-        h2d_sxtream_cast
+        stream
     );
 
-    TORCH_CHECK(err == cudaSuccess, "cudaMemcpyBatchAsync failed: ", cudaGetErrorString(err));
+    TORCH_CHECK(err == cudaSuccess, "cudaMemcpyBatchAsync D2H failed: ", cudaGetErrorString(err));
 }
 }
