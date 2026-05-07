@@ -3,6 +3,7 @@ import torch
 import torch.cuda.nvtx as nvtx
 import grouped_gemm
 
+NUM_LOCAL_LAYERS = 4
 NUM_LOCAL_EXPERTS = 64
 CHUNK_SIZE = 16
 HIDDEN_SIZE = 4096
@@ -212,11 +213,65 @@ def bench_groupgemm_with_h2d(
     return fc1_no_h2d_ms, fc2_no_h2d_ms, fc1_h2d_ms, fc2_h2d_ms
 
 
+def moe_size(num_local_layers, num_local_experts, hidden_size, moe_ffn_hidden_size, chunk_size, total_tokens, master_weights=False):
+    element_size = torch.bfloat16.itemsize
+
+    per_expert_weight_bytes = (
+        (hidden_size * moe_ffn_hidden_size * 2) + (moe_ffn_hidden_size * hidden_size)
+    ) * num_local_layers * element_size # weights for FC1 (gate+up) and FC2 per expert (swiglu style)
+    per_chunk_weight_bytes = per_expert_weight_bytes * chunk_size
+    total_moe_weight_bytes = per_expert_weight_bytes * num_local_experts
+
+    total_moe_main_grad_bytes = total_moe_weight_bytes * 2 # main gradients are same size as weights, and we assume they are stored in the same precision (e.g., bfloat16)
+    per_expert_main_grad_bytes = per_expert_weight_bytes * 2
+    per_chunk_main_grad_bytes = per_chunk_weight_bytes * 2
+    avg_tokens_per_expert = total_tokens / num_local_experts
+    avg_tokens_per_chunk = avg_tokens_per_expert * chunk_size
+
+    # We see the operation as H_e = X_eW_{1,e} \in R^{T_e x 2 * H_{ffn}}, A_e = Swiglu(H_e) \in R^{T_e x H_{ffn}}, AS_e = A_E * Broadcast(S_e) \in R^{T_e x H_{ffn}}, Y_e = AS_e W_{2,e} \in R^{T_e x H}, where e is expert index, T_e is token count for expert e, H is hidden size, and H_{ffn} is MoE FFN hidden size per branch.
+
+    num_stages = num_local_experts // chunk_size
+    a_e = avg_tokens_per_chunk * moe_ffn_hidden_size * element_size # A_e: SwiGLU output
+    as_e = avg_tokens_per_chunk * moe_ffn_hidden_size * element_size # AS_e: router-scaled SwiGLU output (actual FC2 input), needed for FC2 weight grad
+    h_e = avg_tokens_per_chunk * moe_ffn_hidden_size * 2 * element_size # H_e: raw FC1 output (gate+up), needed for SwiGLU backward
+    x_e = avg_tokens_per_chunk * hidden_size * element_size # X_e: FC1 input, needed for FC1 weight grad
+    per_chunk_activation_bytes = a_e + as_e + h_e + x_e
+    # All chunks of all layers must be kept alive simultaneously during backward
+    total_activation_bytes = per_chunk_activation_bytes * num_stages * num_local_layers
+    fp32_size = torch.float32.itemsize
+    per_expert_master_weight_bytes = (per_expert_weight_bytes // element_size) * fp32_size
+    per_chunk_master_weight_bytes = per_expert_master_weight_bytes * chunk_size
+    total_moe_master_weight_bytes = per_expert_master_weight_bytes * num_local_experts
+    total_moe_master_grad_bytes = total_moe_master_weight_bytes
+
+    total = total_moe_weight_bytes + total_moe_main_grad_bytes + total_moe_master_weight_bytes + total_moe_master_grad_bytes + total_activation_bytes
+
+    print("\n=== MoE Size Estimation ===")
+    print(f"  Per expert weights (bf16, {num_local_layers} layers): {per_expert_weight_bytes / 1e9:.2f} GB")
+    print(f"  Per chunk weights (bf16, {chunk_size} experts x {num_local_layers} layers): {per_chunk_weight_bytes / 1e9:.2f} GB")
+    print(f"  MoE FFN weights (bf16, {num_local_experts} experts x {num_local_layers} layers): {total_moe_weight_bytes / 1e9:.2f} GB")
+    print(f"  Per expert main gradients ({num_local_layers} layers): {per_expert_main_grad_bytes / 1e9:.2f} GB")
+    print(f"  Per chunk main gradients ({chunk_size} experts x {num_local_layers} layers): {per_chunk_main_grad_bytes / 1e9:.2f} GB")
+    print(f"  MoE FFN main gradients ({num_local_experts} experts x {num_local_layers} layers): {total_moe_main_grad_bytes / 1e9:.2f} GB")
+    print(f"  Per expert master weights (fp32, {num_local_layers} layers): {per_expert_master_weight_bytes / 1e9:.2f} GB")
+    print(f"  Per chunk master weights (fp32, {chunk_size} experts x {num_local_layers} layers): {per_chunk_master_weight_bytes / 1e9:.2f} GB")
+    print(f"  MoE FFN master weights (fp32, {num_local_experts} experts x {num_local_layers} layers): {total_moe_master_weight_bytes / 1e9:.2f} GB")
+    print(f"  MoE FFN master grads   (fp32, {num_local_experts} experts x {num_local_layers} layers): {total_moe_master_grad_bytes / 1e9:.2f} GB")
+    print(f"  Activations per chunk (A_e + AS_e + H_e + X_e): {per_chunk_activation_bytes / 1e9:.2f} GB")
+    print(f"    A_e  (SwiGLU output):                {a_e / 1e9:.2f} GB")
+    print(f"    AS_e (scaled SwiGLU output, FC2 in): {as_e / 1e9:.2f} GB")
+    print(f"    H_e  (FC1 output pre-SwiGLU):        {h_e / 1e9:.2f} GB")
+    print(f"    X_e  (FC1 input):                    {x_e / 1e9:.2f} GB")
+    print(f"  Total activations ({num_stages} stages x {num_local_layers} layers): {total_activation_bytes / 1e9:.2f} GB")
+    print(f"  Total: {total / 1e9:.2f} GB")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", action="store_true", help="Disable warmup and run 1 iteration (for nsys profiling)")
     parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, help=f"Experts per H2D stage (default: {CHUNK_SIZE})")
     parser.add_argument("--num-local-experts", type=int, default=NUM_LOCAL_EXPERTS, help=f"Number of local experts (default: {NUM_LOCAL_EXPERTS})")
+    parser.add_argument("--num-local-layers", type=int, default=NUM_LOCAL_LAYERS, help=f"Number of local MoE layers (default: {NUM_LOCAL_LAYERS})")
     parser.add_argument(
         "--total-tokens",
         type=int,
@@ -248,6 +303,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Subtract the measured time of one H2D group load from the averaged overlapped timing",
     )
+    parser.add_argument("--print-sizes", action="store_true", help="Only print MoE size estimation and exit")
     args = parser.parse_args()
 
     if args.num_local_experts % args.chunk_size != 0:
@@ -256,6 +312,17 @@ if __name__ == "__main__":
         raise ValueError("--total-tokens must be >= --num-local-experts")
     if args.variable_tokens_max_factor < 1.0:
         raise ValueError("--variable-tokens-max-factor must be >= 1.0")
+
+    if args.print_sizes:
+        moe_size(
+            num_local_layers=args.num_local_layers,
+            num_local_experts=args.num_local_experts,
+            hidden_size=args.hidden_size,
+            moe_ffn_hidden_size=args.moe_ffn_hidden_size,
+            chunk_size=args.chunk_size,
+            total_tokens=args.total_tokens,
+        )
+        exit(0)
 
     warmup = 0 if args.profile else args.warmup
     iters = 1 if args.profile else args.iters
@@ -271,6 +338,15 @@ if __name__ == "__main__":
         warmup=warmup,
         iters=iters,
         skip_prefetch_timing=args.skip_prefetch_timing
+    )
+
+    moe_size(
+        num_local_layers=args.num_local_layers,
+        num_local_experts=args.num_local_experts,
+        hidden_size=args.hidden_size,
+        moe_ffn_hidden_size=args.moe_ffn_hidden_size,
+        chunk_size=args.chunk_size,
+        total_tokens=args.total_tokens,
     )
 
     print("\n=== Overlap Summary ===")
