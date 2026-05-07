@@ -222,9 +222,9 @@ def moe_size(num_local_layers, num_local_experts, hidden_size, moe_ffn_hidden_si
     per_chunk_weight_bytes = per_expert_weight_bytes * chunk_size
     total_moe_weight_bytes = per_expert_weight_bytes * num_local_experts
 
-    total_moe_main_grad_bytes = total_moe_weight_bytes * 2 # main gradients are same size as weights, and we assume they are stored in the same precision (e.g., bfloat16)
-    per_expert_main_grad_bytes = per_expert_weight_bytes * 2
-    per_chunk_main_grad_bytes = per_chunk_weight_bytes * 2
+    total_moe_main_grad_bytes = total_moe_weight_bytes
+    per_expert_main_grad_bytes = per_expert_weight_bytes
+    per_chunk_main_grad_bytes = per_chunk_weight_bytes
     avg_tokens_per_expert = total_tokens / num_local_experts
     avg_tokens_per_chunk = avg_tokens_per_expert * chunk_size
 
@@ -242,21 +242,19 @@ def moe_size(num_local_layers, num_local_experts, hidden_size, moe_ffn_hidden_si
     per_expert_master_weight_bytes = (per_expert_weight_bytes // element_size) * fp32_size
     per_chunk_master_weight_bytes = per_expert_master_weight_bytes * chunk_size
     total_moe_master_weight_bytes = per_expert_master_weight_bytes * num_local_experts
-    total_moe_master_grad_bytes = total_moe_master_weight_bytes
 
-    total = total_moe_weight_bytes + total_moe_main_grad_bytes + total_moe_master_weight_bytes + total_moe_master_grad_bytes + total_activation_bytes
+    total = total_moe_weight_bytes + total_moe_main_grad_bytes + total_moe_master_weight_bytes + total_activation_bytes
 
     print("\n=== MoE Size Estimation ===")
     print(f"  Per expert weights (bf16, {num_local_layers} layers): {per_expert_weight_bytes / 1e9:.2f} GB")
     print(f"  Per chunk weights (bf16, {chunk_size} experts x {num_local_layers} layers): {per_chunk_weight_bytes / 1e9:.2f} GB")
     print(f"  MoE FFN weights (bf16, {num_local_experts} experts x {num_local_layers} layers): {total_moe_weight_bytes / 1e9:.2f} GB")
-    print(f"  Per expert main gradients ({num_local_layers} layers): {per_expert_main_grad_bytes / 1e9:.2f} GB")
-    print(f"  Per chunk main gradients ({chunk_size} experts x {num_local_layers} layers): {per_chunk_main_grad_bytes / 1e9:.2f} GB")
-    print(f"  MoE FFN main gradients ({num_local_experts} experts x {num_local_layers} layers): {total_moe_main_grad_bytes / 1e9:.2f} GB")
+    print(f"  Per expert main gradients (bf16, {num_local_layers} layers): {per_expert_main_grad_bytes / 1e9:.2f} GB")
+    print(f"  Per chunk main gradients (bf16, {chunk_size} experts x {num_local_layers} layers): {per_chunk_main_grad_bytes / 1e9:.2f} GB")
+    print(f"  MoE FFN main gradients (bf16, {num_local_experts} experts x {num_local_layers} layers): {total_moe_main_grad_bytes / 1e9:.2f} GB")
     print(f"  Per expert master weights (fp32, {num_local_layers} layers): {per_expert_master_weight_bytes / 1e9:.2f} GB")
     print(f"  Per chunk master weights (fp32, {chunk_size} experts x {num_local_layers} layers): {per_chunk_master_weight_bytes / 1e9:.2f} GB")
     print(f"  MoE FFN master weights (fp32, {num_local_experts} experts x {num_local_layers} layers): {total_moe_master_weight_bytes / 1e9:.2f} GB")
-    print(f"  MoE FFN master grads   (fp32, {num_local_experts} experts x {num_local_layers} layers): {total_moe_master_grad_bytes / 1e9:.2f} GB")
     print(f"  Activations per chunk (A_e + AS_e + H_e + X_e): {per_chunk_activation_bytes / 1e9:.2f} GB")
     print(f"    A_e  (SwiGLU output):                {a_e / 1e9:.2f} GB")
     print(f"    AS_e (scaled SwiGLU output, FC2 in): {as_e / 1e9:.2f} GB")
